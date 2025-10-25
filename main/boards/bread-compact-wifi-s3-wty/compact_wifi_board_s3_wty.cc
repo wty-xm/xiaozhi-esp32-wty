@@ -6,14 +6,22 @@
 #include "button.h"
 #include "config.h"
 #include "led/single_led.h"
+#include "mcp_server.h"
+#include "protocols/yp0x_uart.h"
 
 #include <wifi_station.h>
 #include <esp_log.h>
+#include <esp_err.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
+
+#include <optional>
+#include <string>
+#include <cstdio>
+#include <stdexcept>
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -61,6 +69,16 @@ class CompactWifiBoardS3Wty : public WifiBoard {
 private:
     Button boot_button_;
     LcdDisplay* display_ = nullptr;
+    Yp0xHost blood_pressure_host_;
+    bool blood_pressure_initialized_ = false;
+    std::optional<Yp0xResult> last_bp_result_;
+    struct {
+        bool valid = false;
+        uint8_t major = 0;
+        uint8_t minor = 0;
+        uint8_t patch = 0;
+        uint8_t model = 0;
+    } bp_version_;
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
@@ -129,6 +147,124 @@ private:
         });
     }
 
+    void InitializeBloodPressureInterface() {
+        if (blood_pressure_initialized_) {
+            return;
+        }
+
+        esp_err_t err = blood_pressure_host_.Init(BP_UART_PORT, BP_UART_TX_PIN, BP_UART_RX_PIN, BP_UART_BAUDRATE);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to init blood pressure UART: %s", esp_err_to_name(err));
+            return;
+        }
+
+        blood_pressure_host_.OnVersion([this](uint8_t major, uint8_t minor, uint8_t patch, uint8_t model) {
+            bp_version_.valid = true;
+            bp_version_.major = major;
+            bp_version_.minor = minor;
+            bp_version_.patch = patch;
+            bp_version_.model = model;
+            ESP_LOGI(TAG, "BP version: %u.%u.%u (model 0x%02X)", major, minor, patch, model);
+        });
+
+        blood_pressure_host_.OnResult([this](const Yp0xResult& result) {
+            last_bp_result_ = result;
+            ESP_LOGI(TAG,
+                     "BP measurement info=0x%02X SYS=%u DIA=%u MAP=%u PULSE=%u EXT=0x%02X",
+                     result.info, result.systolic, result.diastolic, result.mean,
+                     result.pulse, result.reserved);
+        });
+
+        blood_pressure_host_.Start();
+        blood_pressure_initialized_ = true;
+
+        auto& mcp_server = McpServer::GetInstance();
+
+        mcp_server.AddTool(
+            "self.bp.start_measure", "启动血压测量", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                const esp_err_t start_err = blood_pressure_host_.StartMeasure();
+                if (start_err != ESP_OK) {
+                    throw std::runtime_error(std::string("启动测量失败: ") + esp_err_to_name(start_err));
+                }
+                return true;
+            });
+
+        mcp_server.AddTool(
+            "self.bp.stop_measure", "停止血压测量/休眠血压计", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                const esp_err_t stop_err = blood_pressure_host_.StopMeasure();
+                if (stop_err != ESP_OK) {
+                    throw std::runtime_error(std::string("停止测量失败: ") + esp_err_to_name(stop_err));
+                }
+                return true;
+            });
+
+        mcp_server.AddTool(
+            "self.bp.query_version", "查询血压计版本信息", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                const esp_err_t query_err = blood_pressure_host_.QueryVersion();
+                if (query_err != ESP_OK) {
+                    throw std::runtime_error(std::string("查询版本失败: ") + esp_err_to_name(query_err));
+                }
+                return true;
+            });
+
+        mcp_server.AddTool(
+            "self.bp.query_last", "查询血压计最后一次测量结果", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                const esp_err_t query_err = blood_pressure_host_.QueryLastMeasurement();
+                if (query_err != ESP_OK) {
+                    throw std::runtime_error(std::string("查询测量值失败: ") + esp_err_to_name(query_err));
+                }
+                return true;
+            });
+
+        mcp_server.AddTool(
+            "self.bp.get_cached_version", "获取已缓存的血压计版本信息(若有)", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                if (!bp_version_.valid) {
+                    return std::string("暂无版本信息");
+                }
+                char buffer[64];
+                snprintf(buffer, sizeof(buffer), "%u.%u.%u (model 0x%02X)",
+                         bp_version_.major, bp_version_.minor, bp_version_.patch, bp_version_.model);
+                return std::string(buffer);
+            });
+
+        mcp_server.AddTool(
+            "self.bp.get_cached_result", "获取已缓存的血压测量结果(若有)", PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!blood_pressure_initialized_) {
+                    throw std::runtime_error("血压串口未初始化");
+                }
+                if (!last_bp_result_.has_value()) {
+                    return std::string("暂无测量结果");
+                }
+                const auto& result = last_bp_result_.value();
+                char buffer[96];
+                snprintf(buffer, sizeof(buffer),
+                         "info=0x%02X systolic=%u diastolic=%u mean=%u pulse=%u extra=0x%02X",
+                         result.info, result.systolic, result.diastolic, result.mean, result.pulse, result.reserved);
+                return std::string(buffer);
+            });
+    }
+
 public:
     CompactWifiBoardS3Wty() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeSpi();
@@ -139,6 +275,7 @@ public:
                 backlight->RestoreBrightness();
             }
         }
+        InitializeBloodPressureInterface();
     }
 
     virtual Led* GetLed() override {
