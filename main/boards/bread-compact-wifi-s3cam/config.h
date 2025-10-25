@@ -307,7 +307,7 @@
 #define LAMP_GPIO GPIO_NUM_14
 
 #define BP_UART_PORT            UART_NUM_1
-#define BP_UART_TX_PIN          GPIO_NUM_35
+#define BP_UART_TX_PIN          GPIO_NUM_3
 #define BP_UART_RX_PIN          GPIO_NUM_36
 #define BP_UART_BAUDRATE        115200
 
