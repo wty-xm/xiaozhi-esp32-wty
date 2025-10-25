@@ -1,6 +1,7 @@
 #ifndef MAIN_PROTOCOLS_YP0X_UART_H_
 #define MAIN_PROTOCOLS_YP0X_UART_H_
 
+#include <driver/gpio.h>
 #include <driver/uart.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
