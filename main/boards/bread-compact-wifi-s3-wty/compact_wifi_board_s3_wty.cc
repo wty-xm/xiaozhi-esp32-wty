@@ -101,7 +101,7 @@ private:
     void AnnounceBloodPressure(const Yp0xResult& result) {
         char text[160];
         snprintf(text, sizeof(text),
-                 "最新测量结果：收缩压 %u 毫米汞柱，舒张压 %u 毫米汞柱，心率 %u 次每分钟。",
+                 "Latest measurement: systolic %u mmHg, diastolic %u mmHg, heart rate %u bpm.",
                  result.systolic, result.diastolic, result.pulse);
 
         cJSON* root = cJSON_CreateObject();
@@ -259,51 +259,50 @@ private:
         auto& mcp_server = McpServer::GetInstance();
 
         mcp_server.AddTool(
-            "self.bp.start_measure", "启动血压测量", PropertyList(),
+            "self.bp.start_measure", "Start blood pressure measurement", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
                 const esp_err_t start_err = blood_pressure_host_.StartMeasure();
                 if (start_err != ESP_OK) {
-                    throw std::runtime_error(std::string("启动测量失败: ") + esp_err_to_name(start_err));
+                    throw std::runtime_error(std::string("Failed to start measurement: ") + esp_err_to_name(start_err));
                 }
                 bp_auto_report_pending_ = true;
                 return true;
             });
 
         mcp_server.AddTool(
-            "self.bp.stop_measure", "停止血压测量/休眠血压计", PropertyList(),
+            "self.bp.stop_measure", "Stop measurement / put meter to standby", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
                 const esp_err_t stop_err = blood_pressure_host_.StopMeasure();
                 if (stop_err != ESP_OK) {
-                    throw std::runtime_error(std::string("停止测量失败: ") + esp_err_to_name(stop_err));
+                    throw std::runtime_error(std::string("Failed to stop measurement: ") + esp_err_to_name(stop_err));
                 }
                 return true;
             });
 
         mcp_server.AddTool(
-            "self.bp.query_version", "查询血压计版本信息", PropertyList(),
+            "self.bp.query_version", "Query meter firmware version", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
                 const esp_err_t query_err = blood_pressure_host_.QueryVersion();
                 if (query_err != ESP_OK) {
-                    throw std::runtime_error(std::string("查询版本失败: ") + esp_err_to_name(query_err));
+                    throw std::runtime_error(std::string("Failed to query version: ") + esp_err_to_name(query_err));
                 }
                 return true;
             });
 
         mcp_server.AddTool(
-        mcp_server.AddTool(
-            "self.bp.query_last", "查询血压计最后一次测量结果", PropertyList(),
+            "self.bp.query_last", "Query last measurement result", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
 
                 bp_auto_report_pending_ = true;
@@ -314,7 +313,7 @@ private:
 
                 const esp_err_t query_err = blood_pressure_host_.QueryLastMeasurement();
                 if (query_err != ESP_OK) {
-                    throw std::runtime_error(std::string("查询测量值失败: ") + esp_err_to_name(query_err));
+                    throw std::runtime_error(std::string("Failed to query measurement: ") + esp_err_to_name(query_err));
                 }
 
                 bool received = false;
@@ -328,7 +327,7 @@ private:
                 }
 
                 if (!last_bp_result_.has_value()) {
-                    throw std::runtime_error("暂无测量结果");
+                    throw std::runtime_error("No measurement available");
                 }
 
                 if (received) {
@@ -337,14 +336,15 @@ private:
 
                 return FormatBpResult(last_bp_result_.value());
             });
-            });
-self.bp.get_cached_version", "获取已缓存的血压计版本信息(若有)", PropertyList(),
+
+        mcp_server.AddTool(
+            "self.bp.get_cached_version", "Get cached version info (if any)", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
                 if (!bp_version_.valid) {
-                    return std::string("暂无版本信息");
+                    return std::string("No version info");
                 }
                 char buffer[64];
                 snprintf(buffer, sizeof(buffer), "%u.%u.%u (model 0x%02X)",
@@ -353,13 +353,13 @@ self.bp.get_cached_version", "获取已缓存的血压计版本信息(若有)", 
             });
 
         mcp_server.AddTool(
-            "self.bp.get_cached_result", "获取已缓存的血压测量结果(若有)", PropertyList(),
+            "self.bp.get_cached_result", "Get cached measurement (if any)", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
-                    throw std::runtime_error("血压串口未初始化");
+                    throw std::runtime_error("Blood pressure UART not initialized");
                 }
                 if (!last_bp_result_.has_value()) {
-                    return std::string("暂无测量结果");
+                    return std::string("No measurement available");
                 }
                 return FormatBpResult(last_bp_result_.value());
             });
