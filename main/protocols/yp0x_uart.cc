@@ -11,6 +11,33 @@ constexpr const char* kTag = "Yp0xHost";
 constexpr TickType_t kReadTimeoutTicks = pdMS_TO_TICKS(20);
 constexpr uint8_t kAckBitMask = 0x40;
 constexpr uint8_t kCommandIdMask = 0x3F;
+
+constexpr uint16_t DecodeMeasurementWord(uint8_t low, uint8_t high) {
+    return static_cast<uint16_t>(low) |
+           (static_cast<uint16_t>(high) << 8);
+}
+
+bool DecodeMeasurementFrame(const uint8_t* data,
+                            size_t data_len,
+                            const Yp0xHost::ResultCallback& cb) {
+    if (!cb) {
+        return false;
+    }
+    if (data_len < 8) {
+        ESP_LOGW(kTag, "Measurement frame too short: %u",
+                 static_cast<unsigned>(data_len));
+        return false;
+    }
+    Yp0xResult result;
+    result.info = data[0];
+    result.systolic = DecodeMeasurementWord(data[1], data[2]);
+    result.diastolic = data[3];
+    result.mean = data[4];
+    result.pulse = DecodeMeasurementWord(data[5], data[6]);
+    result.reserved = data[7];
+    cb(result);
+    return true;
+}
 }  // namespace
 
 Yp0xHost::~Yp0xHost() {
@@ -215,19 +242,25 @@ void Yp0xHost::FeedByte(uint8_t byte) {
                                                 ? static_cast<size_t>(expected_length_ - 2)
                                                 : 0;
 
-                    if (command_id == 0x31 && data_len >= 8 && on_result_) {
-                        Yp0xResult result;
-                        result.info = data[0];
-                        result.systolic =
-                            static_cast<uint16_t>(data[1]) |
-                            (static_cast<uint16_t>(data[2]) << 8);
-                        result.diastolic = data[3];
-                        result.mean = data[4];
-                        result.pulse =
-                            static_cast<uint16_t>(data[5]) |
-                            (static_cast<uint16_t>(data[6]) << 8);
-                        result.reserved = data[7];
-                        on_result_(result);
+                    ESP_LOGI(kTag,
+                             "Parsed frame cmd=0x%02X len=%u (frame bytes below)",
+                             command_id, static_cast<unsigned>(data_len));
+                    ESP_LOG_BUFFER_HEX_LEVEL(kTag, buffer_, buffer_pos_,
+                                             ESP_LOG_INFO);
+
+                    if (command_id == 0x31) {
+                        if (data_len >= 8) {
+                            DecodeMeasurementFrame(data, data_len, on_result_);
+                        } else {
+                            ESP_LOGD(kTag,
+                                     "Ignored short status frame (cmd=0x31, len=%u)",
+                                     static_cast<unsigned>(data_len));
+                        }
+                    } else if (command_id == 0x32) {
+                        if (!DecodeMeasurementFrame(data, data_len, on_result_)) {
+                            ESP_LOGW(kTag,
+                                     "Failed to decode measurement query response");
+                        }
                     } else if (command_id == 0x39 && data_len >= 4 &&
                                on_version_) {
                         const uint8_t major = data[0] & 0x7F;
