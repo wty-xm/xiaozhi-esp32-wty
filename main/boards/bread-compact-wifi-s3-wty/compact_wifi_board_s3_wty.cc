@@ -23,6 +23,12 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
+#include <cJSON.h>
+
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
 #endif
@@ -72,6 +78,9 @@ private:
     Yp0xHost blood_pressure_host_;
     bool blood_pressure_initialized_ = false;
     std::optional<Yp0xResult> last_bp_result_;
+    std::optional<Yp0xResult> last_announced_bp_result_;
+    bool bp_auto_report_pending_ = false;
+    SemaphoreHandle_t bp_result_sem_ = nullptr;
     struct {
         bool valid = false;
         uint8_t major = 0;
@@ -79,6 +88,47 @@ private:
         uint8_t patch = 0;
         uint8_t model = 0;
     } bp_version_;
+
+    std::string FormatBpResult(const Yp0xResult& result) const {
+        char buffer[96];
+        snprintf(buffer, sizeof(buffer),
+                 "info=0x%02X systolic=%u diastolic=%u mean=%u pulse=%u extra=0x%02X",
+                 result.info, result.systolic, result.diastolic, result.mean,
+                 result.pulse, result.reserved);
+        return std::string(buffer);
+    }
+
+    void AnnounceBloodPressure(const Yp0xResult& result) {
+        char text[160];
+        snprintf(text, sizeof(text),
+                 "最新测量结果：收缩压 %u 毫米汞柱，舒张压 %u 毫米汞柱，心率 %u 次每分钟。",
+                 result.systolic, result.diastolic, result.pulse);
+
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+        cJSON_AddStringToObject(root, "method", "client.callbacks.on_message");
+
+        cJSON* params = cJSON_CreateObject();
+        cJSON* messages = cJSON_CreateArray();
+
+        cJSON* message = cJSON_CreateObject();
+        cJSON_AddStringToObject(message, "role", "assistant");
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text_obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(text_obj, "type", "text");
+        cJSON_AddStringToObject(text_obj, "text", text);
+        cJSON_AddItemToArray(content, text_obj);
+        cJSON_AddItemToObject(message, "content", content);
+        cJSON_AddItemToArray(messages, message);
+
+        cJSON_AddItemToObject(params, "messages", messages);
+        cJSON_AddItemToObject(root, "params", params);
+
+        char* payload = cJSON_PrintUnformatted(root);
+        Application::GetInstance().SendMcpMessage(payload);
+        cJSON_free(payload);
+        cJSON_Delete(root);
+    }
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
@@ -151,6 +201,15 @@ private:
         if (blood_pressure_initialized_) {
             return;
         }
+        if (bp_result_sem_ == nullptr) {
+            bp_result_sem_ = xSemaphoreCreateBinary();
+            if (bp_result_sem_ == nullptr) {
+                ESP_LOGE(TAG, "Failed to create BP result semaphore");
+            }
+        } else {
+            while (xSemaphoreTake(bp_result_sem_, 0) == pdTRUE) {
+            }
+        }
 
         esp_err_t err = blood_pressure_host_.Init(BP_UART_PORT, BP_UART_TX_PIN, BP_UART_RX_PIN, BP_UART_BAUDRATE);
         if (err != ESP_OK) {
@@ -173,6 +232,25 @@ private:
                      "BP measurement info=0x%02X SYS=%u DIA=%u MAP=%u PULSE=%u EXT=0x%02X",
                      result.info, result.systolic, result.diastolic, result.mean,
                      result.pulse, result.reserved);
+
+            const bool should_announce =
+                bp_auto_report_pending_ ||
+                !last_announced_bp_result_.has_value() ||
+                result.systolic != last_announced_bp_result_->systolic ||
+                result.diastolic != last_announced_bp_result_->diastolic ||
+                result.pulse != last_announced_bp_result_->pulse;
+
+            if (should_announce) {
+                bp_auto_report_pending_ = false;
+                AnnounceBloodPressure(result);
+                last_announced_bp_result_ = result;
+            } else {
+                last_announced_bp_result_ = result;
+            }
+
+            if (bp_result_sem_) {
+                xSemaphoreGive(bp_result_sem_);
+            }
         });
 
         blood_pressure_host_.Start();
@@ -190,6 +268,7 @@ private:
                 if (start_err != ESP_OK) {
                     throw std::runtime_error(std::string("启动测量失败: ") + esp_err_to_name(start_err));
                 }
+                bp_auto_report_pending_ = true;
                 return true;
             });
 
@@ -220,20 +299,46 @@ private:
             });
 
         mcp_server.AddTool(
+        mcp_server.AddTool(
             "self.bp.query_last", "查询血压计最后一次测量结果", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
                     throw std::runtime_error("血压串口未初始化");
                 }
+
+                bp_auto_report_pending_ = true;
+                if (bp_result_sem_ != nullptr) {
+                    while (xSemaphoreTake(bp_result_sem_, 0) == pdTRUE) {
+                    }
+                }
+
                 const esp_err_t query_err = blood_pressure_host_.QueryLastMeasurement();
                 if (query_err != ESP_OK) {
                     throw std::runtime_error(std::string("查询测量值失败: ") + esp_err_to_name(query_err));
                 }
-                return true;
-            });
 
-        mcp_server.AddTool(
-            "self.bp.get_cached_version", "获取已缓存的血压计版本信息(若有)", PropertyList(),
+                bool received = false;
+                if (bp_result_sem_ != nullptr) {
+                    received = xSemaphoreTake(bp_result_sem_, pdMS_TO_TICKS(1500)) == pdTRUE;
+                    if (!received) {
+                        ESP_LOGW(TAG, "Timed out waiting for BP query result");
+                    }
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
+
+                if (!last_bp_result_.has_value()) {
+                    throw std::runtime_error("暂无测量结果");
+                }
+
+                if (received) {
+                    bp_auto_report_pending_ = false;
+                }
+
+                return FormatBpResult(last_bp_result_.value());
+            });
+            });
+self.bp.get_cached_version", "获取已缓存的血压计版本信息(若有)", PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (!blood_pressure_initialized_) {
                     throw std::runtime_error("血压串口未初始化");
@@ -256,12 +361,7 @@ private:
                 if (!last_bp_result_.has_value()) {
                     return std::string("暂无测量结果");
                 }
-                const auto& result = last_bp_result_.value();
-                char buffer[96];
-                snprintf(buffer, sizeof(buffer),
-                         "info=0x%02X systolic=%u diastolic=%u mean=%u pulse=%u extra=0x%02X",
-                         result.info, result.systolic, result.diastolic, result.mean, result.pulse, result.reserved);
-                return std::string(buffer);
+                return FormatBpResult(last_bp_result_.value());
             });
     }
 
